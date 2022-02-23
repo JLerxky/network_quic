@@ -17,31 +17,27 @@ use std::sync::Arc;
 use std::task::Poll;
 use std::time::Duration;
 
-use tokio::net::TcpStream;
+use futures::SinkExt;
+use quinn::ClientConfig;
+use quinn::ConnectionError;
+use quinn::NewConnection;
+use quinn::RecvStream;
+use quinn::SendStream;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time;
 
-use tokio_stream::Stream;
 use tokio_stream::StreamExt;
 
-use tokio_rustls::rustls::{ClientConfig, ServerName};
-use tokio_rustls::TlsConnector;
-
 use futures::future::poll_fn;
-use futures::SinkExt;
 
 use tracing::{debug, info, warn};
 
 use crate::codec::Codec;
-use crate::codec::DecodeError;
 use cita_cloud_proto::network::NetworkMsg;
 
-type TlsStream = tokio_rustls::TlsStream<TcpStream>;
-type ServerTlsStream = tokio_rustls::server::TlsStream<TcpStream>;
-type ClientTlsStream = tokio_rustls::client::TlsStream<TcpStream>;
-
-type Framed = tokio_util::codec::Framed<TlsStream, Codec>;
+type FramedWrite = tokio_util::codec::FramedWrite<SendStream, Codec>;
+type FramedRead = tokio_util::codec::FramedRead<RecvStream, Codec>;
 
 #[derive(Debug)]
 pub struct PeersManger {
@@ -101,7 +97,7 @@ pub struct PeerHandle {
     id: u64,
     host: String,
     port: u16,
-    inbound_stream_tx: mpsc::Sender<ServerTlsStream>,
+    inbound_stream_tx: mpsc::Sender<NewConnection>,
     outbound_msg_tx: mpsc::Sender<NetworkMsg>,
     // run handle
     join_handle: Arc<JoinHandle<()>>,
@@ -120,7 +116,7 @@ impl PeerHandle {
         self.port
     }
 
-    pub fn accept(&self, stream: ServerTlsStream) {
+    pub fn accept(&self, stream: NewConnection) {
         let inbound_stream_tx = self.inbound_stream_tx.clone();
         tokio::spawn(async move {
             let _ = inbound_stream_tx.send(stream).await;
@@ -150,7 +146,7 @@ pub struct Peer {
     // msg received from this peer
     inbound_msg_tx: mpsc::Sender<NetworkMsg>,
 
-    inbound_stream_rx: mpsc::Receiver<ServerTlsStream>,
+    inbound_stream_rx: mpsc::Receiver<NewConnection>,
 }
 
 impl Peer {
@@ -193,8 +189,8 @@ impl Peer {
     }
 
     pub async fn run(mut self) {
-        let mut framed: Option<Framed> = None;
-        let mut pending_conn: Option<JoinHandle<Result<ClientTlsStream, std::io::Error>>> = None;
+        let mut new_conn: Option<quinn::NewConnection> = None;
+        let mut conn_to_peer: Option<JoinHandle<Result<NewConnection, ConnectionError>>> = None;
 
         let reconnect_timeout = Duration::from_secs(self.reconnect_timeout);
         let reconnect_timeout_fut = time::sleep(Duration::from_secs(0));
@@ -203,29 +199,35 @@ impl Peer {
         loop {
             tokio::select! {
                 // spawn task to connect to this peer; outbound stream
-                _ = reconnect_timeout_fut.as_mut(), if framed.is_none() && pending_conn.is_none() => {
+                _ = reconnect_timeout_fut.as_mut(), if new_conn.is_none() && conn_to_peer.is_none() => {
                     let host = self.host.clone();
                     let port = self.port;
+
+                    let tls_config = self.tls_config.clone();
                     info!(peer = %self.domain, host = %host, port = %port, "connecting..");
 
-                    let domain = ServerName::try_from(self.domain.as_str()).unwrap();
-                    let tls_config = self.tls_config.clone();
-
-                    let handle = tokio::spawn(async move {
-                        let connector = TlsConnector::from(tls_config);
-
-                        let tcp = TcpStream::connect((host.as_str(), port)).await?;
-                        connector.connect(domain, tcp).await
+                    let domain = self.domain.clone();
+                    let new_conn = tokio::spawn(async move {
+                        let mut endpoint = quinn::Endpoint::client("[::]:0".parse::<std::net::SocketAddr>().unwrap()).unwrap();
+                        endpoint.set_default_client_config(tls_config.as_ref().clone());
+                        let conn = endpoint
+                            .connect(
+                                format!("{}:{}", host, port).parse::<std::net::SocketAddr>().unwrap(),
+                                &domain,
+                            )
+                            .unwrap()
+                            .await;
+                        conn
                     });
 
-                    pending_conn.replace(handle);
+                    conn_to_peer.replace(new_conn);
                 }
                 // handle previous connection task's result
-                Ok(conn_result) = async { pending_conn.as_mut().unwrap().await }, if pending_conn.is_some() => {
-                    pending_conn.take();
+                Ok(conn_result) = async { conn_to_peer.as_mut().unwrap().await }, if conn_to_peer.is_some() => {
+                    conn_to_peer.take();
 
                     match conn_result {
-                        Ok(stream) => {
+                        Ok(conn) => {
                             info!(
                                 peer = %self.domain,
                                 host = %self.host,
@@ -233,10 +235,7 @@ impl Peer {
                                 r#type = %"outbound",
                                 "new connection established"
                             );
-                            framed.replace(Framed::new(
-                                tokio_rustls::TlsStream::Client(stream),
-                                Codec,
-                            ));
+                            new_conn.replace(conn);
                         }
                         Err(e) => {
                             debug!(
@@ -251,16 +250,13 @@ impl Peer {
                     }
                 }
                 // accept the established conn from this peer; inbound stream
-                Some(stream) = self.inbound_stream_rx.recv() => {
-                    if let Some(h) = pending_conn.take() {
+                Some(conn) = self.inbound_stream_rx.recv() => {
+                    if let Some(h) = conn_to_peer.take() {
                         h.abort();
                     }
                     // receive new stream
-                    if framed.is_none() {
-                        let incoming_peer_addr = stream.get_ref().0
-                            .peer_addr()
-                            .map(|s| s.to_string())
-                            .unwrap_or_else(|e| format!("`unavalable: {}`", e));
+                    if new_conn.is_none() {
+                        let incoming_peer_addr = conn.connection.remote_address();
                         info!(
                             peer = %self.domain,
                             host = %self.host,
@@ -269,10 +265,7 @@ impl Peer {
                             r#type = %"inbound",
                             "new connection established"
                         );
-                        framed.replace(Framed::new(
-                            tokio_rustls::TlsStream::Server(stream),
-                            Codec
-                        ));
+                        new_conn.replace(conn);
                     }
                 }
                 // send out msgs to this peer; outbound msgs
@@ -286,18 +279,34 @@ impl Peer {
                         Poll::Ready(())
                     }).await;
 
-                    if let Some(fd) = framed.as_mut() {
+                    if let Some(conn) = new_conn.as_mut() {
                         let mut last_result = Ok(());
-                        for msg in msgs {
-                            last_result = fd.feed(msg).await;
-                            if last_result.is_err() {
-                                break;
+
+                        if let Ok(send_stream) = conn.connection.open_uni().await {
+                            let mut tx = FramedWrite::new(send_stream, Codec);
+                            for msg in msgs {
+                                last_result = tx.feed(msg).await;
+                                if last_result.is_err() {
+                                    break;
+                                }
                             }
+
+                            if last_result.is_ok() {
+                                last_result = tx.flush().await;
+                            }
+                        } else {
+                            warn!(
+                                peer = %self.domain,
+                                host = %self.host,
+                                port = %self.port,
+                                // reason = %e,
+                                "send outbound msgs failed, drop the stream"
+                            );
+                            new_conn.take();
+                            reconnect_timeout_fut.as_mut().reset(time::Instant::now() + reconnect_timeout);
                         }
 
-                        if last_result.is_ok() {
-                            last_result = fd.flush().await;
-                        }
+
                         if let Err(e) = last_result {
                             warn!(
                                 peer = %self.domain,
@@ -306,7 +315,7 @@ impl Peer {
                                 reason = %e,
                                 "send outbound msgs failed, drop the stream"
                             );
-                            framed.take();
+                            new_conn.take();
                             reconnect_timeout_fut.as_mut().reset(time::Instant::now() + reconnect_timeout);
                         }
                     } else {
@@ -320,29 +329,23 @@ impl Peer {
                     }
                 }
                 // receive msgs from this peer; inbound msgs
-                opt_res = async { framed.as_mut().unwrap().next().await }, if framed.is_some() => {
+                opt_res = async { new_conn.as_mut().unwrap().uni_streams.next().await }, if new_conn.is_some() => {
                     // handle items produced by the stream; return true if the stream should be dropped
-                    let f = |opt_res: Option<Result<NetworkMsg, DecodeError>>| {
-                        match opt_res {
-                            Some(Ok(mut msg)) => {
-                                msg.origin = self.id;
 
+                    let f =  |opt_res: Option<Result<RecvStream, ConnectionError>>| {
+                        match opt_res {
+                            Some(Ok(recv)) => {
+                                let mut rx = FramedRead::new(recv, Codec);
                                 let inbound_msg_tx = self.inbound_msg_tx.clone();
                                 tokio::spawn(async move {
-                                    let _ = inbound_msg_tx.send(msg).await;
+                                    while let Some(Ok(mut msg)) = rx.next().await {
+                                        msg.origin = self.id;
+                                        let _ = inbound_msg_tx.send(msg).await;
+                                    }
+                                    debug!("stream end");
                                 });
+
                                 false
-                            }
-                            Some(Err(DecodeError::Io(e))) => {
-                                // drop the stream
-                                warn!(
-                                    peer = %self.domain,
-                                    host = %self.host,
-                                    port = %self.port,
-                                    reason = %e,
-                                    "framed stream report io error, will drop the stream"
-                                );
-                                true
                             }
                             Some(Err(e)) => {
                                 warn!(
@@ -350,9 +353,9 @@ impl Peer {
                                     host = %self.host,
                                     port = %self.port,
                                     reason = %e,
-                                    "framed stream report decode error"
+                                    "framed stream report error, will drop the stream"
                                 );
-                                false
+                                true
                             }
                             None => {
                                 warn!(
@@ -367,27 +370,10 @@ impl Peer {
                     };
 
                     // drain all the available inbound msgs
-                    let mut wants_drop = f(opt_res);
-                    if !wants_drop {
-                        poll_fn(|cx| {
-                            loop {
-                                let framed_stream = Pin::new(framed.as_mut().unwrap());
-                                match framed_stream.poll_next(cx) {
-                                    Poll::Ready(opt_res) => {
-                                        wants_drop = f(opt_res);
-                                        if wants_drop {
-                                            break;
-                                        }
-                                    }
-                                    Poll::Pending => break,
-                                }
-                            }
-                            Poll::Ready(())
-                        }).await;
-                    }
+                    let wants_drop = f(opt_res);
 
                     if wants_drop {
-                        framed.take();
+                        new_conn.take();
                         reconnect_timeout_fut.as_mut().reset(time::Instant::now() + reconnect_timeout);
                     }
                 }

@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+
 use crate::anchor::RootCertStore;
 use crate::health_check::HealthCheckServer;
 use crate::peer::PeersManger;
@@ -27,26 +31,21 @@ use cita_cloud_proto::network::{
     network_service_server::{NetworkService, NetworkServiceServer},
     NetworkMsg, NetworkStatusResponse, RegisterInfo,
 };
+use futures::StreamExt;
 use parking_lot::RwLock;
-use std::collections::{hash_map::DefaultHasher, HashMap};
+use quinn::ClientConfig;
+use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::sync::Arc;
-use std::time::Duration;
 use std::time::SystemTime;
-use tentacle_multiaddr::MultiAddr;
-use tentacle_multiaddr::Protocol;
-use tokio::net::TcpListener;
+use tentacle_multiaddr::{MultiAddr, Protocol};
 use tokio::sync::mpsc;
 use tokio_rustls::rustls::client::{ServerCertVerified, ServerCertVerifier};
 use tokio_rustls::rustls::server::{ClientCertVerified, ClientCertVerifier};
 use tokio_rustls::rustls::ServerName;
+use tokio_rustls::rustls::{Certificate, DistinguishedNames, Error as TlsError};
 use tokio_rustls::webpki::{
     self, DnsNameRef, EndEntityCert, Time, TlsClientTrustAnchors, TlsServerTrustAnchors,
     TrustAnchor,
-};
-use tokio_rustls::{
-    rustls::{Certificate, ClientConfig, DistinguishedNames, Error as TlsError},
-    TlsAcceptor,
 };
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Request, Response, Status};
@@ -209,14 +208,22 @@ pub struct Server {
     listen_port: u16,
     peers: Arc<RwLock<PeersManger>>,
 
-    tls_acceptor: TlsAcceptor,
+    server_config: quinn::ServerConfig,
 }
 
 impl Server {
     pub async fn setup(config: NetworkConfig, path: String) {
         let roots = load_certs(&config.ca_cert);
         let verifier = AllowKnownPeerOnly::new(roots);
-        let client_config = Arc::new(make_client_config(&config, Arc::new(verifier.clone())));
+        let rustls_client_config =
+            Arc::new(make_client_config(&config, Arc::new(verifier.clone())));
+
+        const IDLE_TIMEOUT: Duration = Duration::from_millis(500);
+        let mut transport_config = quinn::TransportConfig::default();
+        transport_config.keep_alive_interval(Some(IDLE_TIMEOUT));
+
+        let mut client_config = quinn::ClientConfig::new(rustls_client_config);
+        client_config.transport = Arc::new(transport_config);
 
         let (inbound_msg_tx, inbound_msg_rx) = mpsc::channel(1024);
         let peers = {
@@ -226,10 +233,13 @@ impl Server {
                     c.domain.clone(),
                     c.host,
                     c.port,
-                    Arc::clone(&client_config),
+                    Arc::new(client_config.clone()),
                     config.reconnect_timeout,
                     inbound_msg_tx.clone(),
                 );
+
+                info!("peer: {}", c.domain);
+
                 verifier
                     .peers
                     .write()
@@ -238,11 +248,9 @@ impl Server {
             Arc::clone(&verifier.peers)
         };
 
-        let tls_acceptor = {
-            let server_config = Arc::new(make_server_config(&config, Arc::new(verifier)));
-            TlsAcceptor::from(server_config)
-        };
-
+        let rustls_server_config =
+            Arc::new(make_server_config(&config, Arc::new(verifier.clone())));
+        let server_config = quinn::ServerConfig::with_crypto(rustls_server_config);
         let dispatch_table = Arc::new(RwLock::new(HashMap::new()));
         let dispatcher = NetworkMsgDispatcher {
             dispatch_table: dispatch_table.clone(),
@@ -255,7 +263,7 @@ impl Server {
         let network_svc = CitaCloudNetworkServiceServer {
             dispatch_table,
             peers: peers.clone(),
-            tls_config: client_config,
+            tls_config: Arc::new(client_config),
             inbound_msg_tx,
             reconnect_timeout: config.reconnect_timeout,
         };
@@ -301,73 +309,72 @@ impl Server {
         let this = Self {
             listen_port: config.listen_port,
             peers,
-            tls_acceptor,
+            server_config,
         };
 
         this.serve().await;
     }
 
     async fn serve(self) {
-        let addr = ("0.0.0.0", self.listen_port);
-        let listener = TcpListener::bind(addr).await.unwrap();
+        let addr = format!("0.0.0.0:{}", self.listen_port);
+        if let Ok((endpoint, mut incoming)) = quinn::Endpoint::server(
+            self.server_config,
+            addr.parse::<std::net::SocketAddr>().unwrap(),
+        ) {
+            info!("listen on `{}`", endpoint.local_addr().unwrap());
+            while let Some(conn) = incoming.next().await {
+                match conn.await {
+                    Ok(new_conn) => {
+                        let addr = new_conn.connection.remote_address().to_string();
+                        info!("connecting: {}", addr);
+                        let certs = new_conn
+                            .connection
+                            .peer_identity()
+                            .unwrap()
+                            .downcast::<Vec<Certificate>>()
+                            .unwrap();
 
-        info!("listen on `{}:{}`", addr.0, addr.1);
+                        let dns_s: Vec<String> = {
+                            let cert = certs.first().unwrap();
+                            let (_, parsed) = X509Certificate::from_der(cert.as_ref()).unwrap();
+                            if let Some(san) =
+                                parsed.tbs_certificate.subject_alternative_name().unwrap()
+                            {
+                                san.value
+                                    .general_names
+                                    .iter()
+                                    .filter_map(|n| {
+                                        if let GeneralName::DNSName(dns) = *n {
+                                            Some(dns.to_owned())
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .collect()
+                            } else {
+                                vec![]
+                            }
+                        };
 
-        loop {
-            let (stream, _) = match listener.accept().await {
-                Ok(stream) => stream,
-                Err(e) => {
-                    warn!("accept tcp stream error: {}", e);
-                    continue;
-                }
-            };
-
-            let tls_acceptor = self.tls_acceptor.clone();
-            let peers = self.peers.clone();
-            tokio::spawn(async move {
-                // TODO: consider those unwraps and logic
-                let stream = match tls_acceptor.accept(stream).await {
-                    Ok(stream) => stream,
-                    Err(e) => {
-                        warn!("tls report error: {}", e);
-                        return;
-                    }
-                };
-                let certs = stream.get_ref().1.peer_certificates().unwrap();
-                let dns_s: Vec<String> = {
-                    let cert = certs.first().unwrap();
-                    let (_, parsed) = X509Certificate::from_der(cert.as_ref()).unwrap();
-                    if let Some(san) = parsed.tbs_certificate.subject_alternative_name().unwrap() {
-                        san.value
-                            .general_names
+                        let guard = self.peers.read();
+                        if let Some(peer) = dns_s
                             .iter()
-                            .filter_map(|n| {
-                                if let GeneralName::DNSName(dns) = *n {
-                                    Some(dns.to_owned())
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect()
-                    } else {
-                        vec![]
+                            .find_map(|dns| guard.get_known_peers().get(dns))
+                        {
+                            peer.accept(new_conn);
+                        } else {
+                            debug!(
+                                peers = ?&*guard,
+                                cert.dns = ?dns_s,
+                                "no peer instance for this connection"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        debug!("connecting error: {:?}", e);
                     }
                 };
-
-                let guard = peers.read();
-                if let Some(peer) = dns_s
-                    .iter()
-                    .find_map(|dns| guard.get_known_peers().get(dns))
-                {
-                    peer.accept(stream);
-                } else {
-                    debug!(
-                        peers = ?&*guard,
-                        cert.dns = ?dns_s,
-                        "no peer instance for this connection"
-                    );
-                }
-            });
+            }
         }
     }
 }
@@ -451,6 +458,7 @@ impl NetworkService for CitaCloudNetworkServiceServer {
         request: Request<RegisterInfo>,
     ) -> Result<Response<StatusCode>, tonic::Status> {
         let info = request.into_inner();
+        debug!("info: {:?}", &info);
         let module_name = info.module_name;
         let hostname = info.hostname;
         let port = info.port;
